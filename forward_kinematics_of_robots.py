@@ -1,0 +1,52 @@
+import numpy as np
+B1=input("请输入转角1:")
+B2=input("请输入转角2:")
+B3=input("请输入转角3:")
+B4=input("请输入转角4:")
+B5=input("请输入转角5:")
+B6=input("请输入转角6:")
+I2=input("请输入杆长2:")
+I4=input("请输入杆长4:")
+I5=input("请输入杆长5:")
+D1=float(B1)
+D2=float(B2)
+D3=float(B3)
+D4=float(B4)
+D5=float(B5)
+D6=float(B6)
+L2=float(I2)
+L4=float(I4)
+L5=float(I5)
+A1=np.array([
+    [np.cos(D1),0,np.sin(D1),0],
+    [np.sin(D1),0,-np.cos(D1),0],
+    [0,1,0,0],
+    [0,0,0,1]])
+A2=np.array([
+    [np.cos(D2),-np.sin(D2),0,np.cos(D2)*L2],
+    [np.sin(D2),np.cos(D2),0,np.sin(D2)*L2],
+    [0,0,1,0],
+    [0,0,0,1]])
+A3=np.array([
+    [np.cos(D3),-np.sin(D3),0,np.cos(D3)*L4],
+    [np.sin(D3),-np.cos(D3),0,np.sin(D2)*L4],
+    [0,0,1,0],
+    [0,0,0,1]])
+A4=np.array([
+    [np.cos(D4),0,-np.sin(D4),np.cos(D4)*L4],
+    [np.sin(D4),0,np.cos(D4),np.sin(D4)*L5],
+    [0,-1,0,0],
+    [0,0,0,1]])
+A5=np.array([
+    [np.cos(D5),0,np.sin(D5),0],
+    [np.sin(D5),0,-np.cos(D5),0],
+    [0,1,0,0],
+    [0,0,0,1]])
+A6=np.array([
+    [np.cos(D6),-np.sin(D6),0,0],
+    [np.sin(D6),np.cos(D6),0,0],
+    [0,0,1,0],
+    [0,0,0,1]])
+A=A1@A2@A3@A4@A5@A6
+print("机械臂末端姿态:")
+print(A)
