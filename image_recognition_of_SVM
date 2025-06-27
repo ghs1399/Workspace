@@ -1,0 +1,971 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+import joblib
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# Set matplotlib to use default fonts
+plt.rcParams["font.family"] = "DejaVu Sans"
+plt.rcParams["axes.unicode_minus"] = False
+
+
+class MinimalIoUFixSVMRecognition:
+    """
+    MINIMAL IoU FIX - Keep Your Working Code + Add IoU + Bigger Boxes
+
+    CHANGES FROM YOUR WORKING VERSION:
+    1. ✅ Add IoU-based duplicate removal in segmentation
+    2. ✅ Add bigger bounding boxes (padding)
+    3. ❌ NO OTHER CHANGES - Keep everything else exactly the same
+    """
+
+    def __init__(self, output_dir="results/character_recognition_svm"):
+        self.output_dir = output_dir
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+
+        self.pipeline = None
+        self.label_encoder = {}
+        self.reverse_label_encoder = {}
+        self.training_size = None
+        self.training_samples_info = {}
+
+    # ======================================================================
+    # KEEP YOUR WORKING SEGMENTATION METHODS (EXACTLY THE SAME)
+    # ======================================================================
+
+    def detect_rotation_angle(self, image):
+        """KEEP EXACTLY THE SAME - THIS WORKS"""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=100)
+
+        angles = []
+        if lines is not None:
+            for line in lines:
+                rho, theta = line[0]
+                angle = theta * 180 / np.pi
+
+                if angle > 90:
+                    angle = angle - 180
+                elif angle < -90:
+                    angle = angle + 180
+
+                if abs(angle) < 45:
+                    angles.append(angle)
+                elif abs(abs(angle) - 90) < 45:
+                    angles.append(angle - 90 if angle > 0 else angle + 90)
+
+        if angles:
+            rotation_angle = np.median(angles)
+            print(f"  Detected rotation angle: {rotation_angle:.1f}°")
+            return rotation_angle
+        else:
+            print(f"  No clear rotation detected, using 0°")
+            return 0
+
+    def rotate_image(self, image, angle):
+        """KEEP EXACTLY THE SAME - THIS WORKS"""
+        if abs(angle) < 0.5:
+            return image
+
+        h, w = image.shape[:2]
+        center = (w // 2, h // 2)
+
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        cos_angle = abs(matrix[0, 0])
+        sin_angle = abs(matrix[0, 1])
+
+        new_w = int((h * sin_angle) + (w * cos_angle))
+        new_h = int((h * cos_angle) + (w * sin_angle))
+
+        matrix[0, 2] += (new_w / 2) - center[0]
+        matrix[1, 2] += (new_h / 2) - center[1]
+
+        rotated = cv2.warpAffine(
+            image,
+            matrix,
+            (new_w, new_h),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+
+        return rotated
+
+    def find_text_regions(self, image):
+        """KEEP EXACTLY THE SAME - THIS WORKS"""
+        print("Finding text regions...")
+
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+
+        text_regions = []
+
+        _, binary_bright = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
+        closed = cv2.morphologyEx(binary_bright, cv2.MORPH_CLOSE, kernel_large)
+
+        contours, _ = cv2.findContours(
+            closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = cv2.contourArea(contour)
+
+            if (
+                area > 3000
+                and w > 80
+                and h > 30
+                and w < image.shape[1] * 0.8
+                and h < image.shape[0] * 0.8
+            ):
+
+                aspect_ratio = w / h
+                if 1.0 <= aspect_ratio <= 8.0:
+
+                    padding = 10
+                    x1 = max(0, x - padding)
+                    y1 = max(0, y - padding)
+                    x2 = min(image.shape[1], x + w + padding)
+                    y2 = min(image.shape[0], y + h + padding)
+
+                    region_roi = gray[y1:y2, x1:x2]
+
+                    text_regions.append(
+                        {
+                            "bbox": (x1, y1, x2 - x1, y2 - y1),
+                            "roi": region_roi,
+                            "area": area,
+                        }
+                    )
+
+                    print(f"  Found text region: {w}x{h} pixels, area={area:.0f}")
+
+        text_regions.sort(key=lambda x: x["area"], reverse=True)
+        print(f"  Total text regions found: {len(text_regions)}")
+        return text_regions
+
+    def segment_characters_in_region(self, region_roi, region_bbox):
+        """KEEP EXACTLY THE SAME BUT ADD IoU FILTERING AT THE END"""
+        print(f"  Segmenting characters in region...")
+
+        strategies = []
+
+        # Strategy 1: Inverted Otsu thresholding
+        inverted = 255 - region_roi
+        _, thresh_inv = cv2.threshold(
+            inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        thresh_clean = cv2.morphologyEx(thresh_inv, cv2.MORPH_CLOSE, kernel_small)
+        thresh_clean = cv2.morphologyEx(thresh_clean, cv2.MORPH_OPEN, kernel_small)
+
+        strategies.append(("Inverted_Clean", thresh_clean))
+
+        # Strategy 2: Adaptive thresholding
+        adaptive_inv = cv2.adaptiveThreshold(
+            inverted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        strategies.append(("Adaptive_Inverted", adaptive_inv))
+
+        # Strategy 3: Direct dark region detection
+        _, thresh_dark = cv2.threshold(region_roi, 120, 255, cv2.THRESH_BINARY_INV)
+        strategies.append(("Dark_Regions", thresh_dark))
+
+        all_characters = []
+
+        for strategy_name, binary_img in strategies:
+            chars = self.extract_characters_from_binary(
+                binary_img, region_bbox, strategy_name
+            )
+            all_characters.extend(chars)
+            print(f"    {strategy_name}: {len(chars)} characters")
+
+        # KEEP YOUR ORIGINAL FILTERING
+        filtered_chars = self.filter_duplicate_characters(all_characters)
+        print(f"    After original filtering: {len(filtered_chars)} characters")
+
+        # ADD: IoU-based filtering for additional cleanup
+        iou_filtered_chars = self.add_iou_filtering(filtered_chars)
+        print(f"    After IoU filtering: {len(iou_filtered_chars)} characters")
+
+        return iou_filtered_chars, strategies
+
+    def extract_characters_from_binary(self, binary_img, region_bbox, strategy_name):
+        """KEEP EXACTLY THE SAME - THIS WORKS"""
+        region_x, region_y, region_w, region_h = region_bbox
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary_img, connectivity=8
+        )
+
+        characters = []
+
+        for i in range(1, num_labels):
+            x, y, w, h, area = stats[i]
+
+            # Character size filtering
+            min_char_area = 50
+            max_char_area = 3000
+            min_char_width = 5
+            max_char_width = 80
+            min_char_height = 10
+            max_char_height = 60
+
+            if (
+                min_char_area <= area <= max_char_area
+                and min_char_width <= w <= max_char_width
+                and min_char_height <= h <= max_char_height
+            ):
+
+                aspect_ratio = w / h
+                if 0.1 <= aspect_ratio <= 4.0:
+
+                    mask = (labels == i).astype(np.uint8) * 255
+                    char_img = mask[y : y + h, x : x + w]
+
+                    global_x = region_x + x
+                    global_y = region_y + y
+
+                    characters.append(
+                        {
+                            "bbox": (global_x, global_y, w, h),
+                            "local_bbox": (x, y, w, h),
+                            "image": char_img,
+                            "area": area,
+                            "aspect_ratio": aspect_ratio,
+                            "strategy": strategy_name,
+                        }
+                    )
+
+        return characters
+
+    def filter_duplicate_characters(self, characters):
+        """KEEP EXACTLY THE SAME - THIS WORKS"""
+        if len(characters) <= 1:
+            return characters
+
+        strategy_priority = {
+            "Inverted_Clean": 3,
+            "Adaptive_Inverted": 2,
+            "Dark_Regions": 1,
+        }
+        characters.sort(
+            key=lambda x: (x["area"], strategy_priority.get(x["strategy"], 0)),
+            reverse=True,
+        )
+
+        filtered = []
+
+        for char in characters:
+            x1, y1, w1, h1 = char["bbox"]
+
+            is_duplicate = False
+            for existing in filtered:
+                x2, y2, w2, h2 = existing["bbox"]
+
+                x_overlap = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+                y_overlap = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+
+                if x_overlap > 0 and y_overlap > 0:
+                    intersection = x_overlap * y_overlap
+                    area1 = w1 * h1
+
+                    if intersection / area1 > 0.4:
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
+                filtered.append(char)
+
+        filtered.sort(key=lambda x: x["bbox"][0])
+        return filtered
+
+    # ======================================================================
+    # ADD: MINIMAL IoU FILTERING (ONLY NEW ADDITION)
+    # ======================================================================
+
+    def calculate_iou(self, box1, box2):
+        """Calculate IoU between two bounding boxes"""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+
+        # Calculate intersection
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+
+        if union == 0:
+            return 0.0
+
+        return intersection / union
+
+    def add_iou_filtering(self, characters, iou_threshold=0.2):
+        """Add gentle IoU-based filtering to existing pipeline"""
+        if len(characters) <= 1:
+            return characters
+
+        print(f"      Applying gentle IoU filtering (threshold={iou_threshold})...")
+
+        # Sort by area (keep larger characters when there's overlap)
+        characters.sort(key=lambda x: x["area"], reverse=True)
+
+        kept_characters = []
+
+        for char in characters:
+            should_keep = True
+
+            for kept_char in kept_characters:
+                iou = self.calculate_iou(char["bbox"], kept_char["bbox"])
+
+                if iou > iou_threshold:
+                    should_keep = False
+                    print(f"        Removing overlap (IoU={iou:.3f})")
+                    break
+
+            if should_keep:
+                kept_characters.append(char)
+
+        # Sort back by x-coordinate
+        kept_characters.sort(key=lambda x: x["bbox"][0])
+        return kept_characters
+
+    # ======================================================================
+    # KEEP YOUR WORKING TRAINING CODE (EXACTLY THE SAME)
+    # ======================================================================
+
+    def analyze_training_data_sizes(self, train_folder):
+        """KEEP EXACTLY THE SAME"""
+        print("Analyzing training data sizes...")
+
+        class_folders = [
+            f
+            for f in os.listdir(train_folder)
+            if os.path.isdir(os.path.join(train_folder, f))
+        ]
+
+        all_sizes = []
+        size_info = {}
+
+        for class_name in class_folders:
+            class_path = os.path.join(train_folder, class_name)
+            class_sizes = []
+
+            for filename in os.listdir(class_path):
+                if filename.lower().endswith((".bmp", ".jpg", ".jpeg", ".png")):
+                    image_path = os.path.join(class_path, filename)
+                    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                    if image is not None:
+                        h, w = image.shape
+                        class_sizes.append((w, h))
+                        all_sizes.append((w, h))
+
+            if class_sizes:
+                avg_w = int(np.mean([s[0] for s in class_sizes]))
+                avg_h = int(np.mean([s[1] for s in class_sizes]))
+                size_info[class_name] = {
+                    "count": len(class_sizes),
+                    "avg_size": (avg_w, avg_h),
+                    "sizes": class_sizes,
+                }
+                print(
+                    f"  Class '{class_name}': {len(class_sizes)} samples, avg size: {avg_w}x{avg_h}"
+                )
+
+        if all_sizes:
+            # Calculate most common size
+            avg_w = int(np.mean([s[0] for s in all_sizes]))
+            avg_h = int(np.mean([s[1] for s in all_sizes]))
+
+            # Find the most common size (mode)
+            from collections import Counter
+
+            size_counts = Counter(all_sizes)
+            most_common_size = size_counts.most_common(1)[0][0]
+
+            print(f"  Overall: {len(all_sizes)} training images")
+            print(f"  Average size: {avg_w}x{avg_h}")
+            print(f"  Most common size: {most_common_size[0]}x{most_common_size[1]}")
+
+            # Use the most common size as target
+            self.training_size = most_common_size
+            print(
+                f"  Selected training size: {self.training_size[0]}x{self.training_size[1]}"
+            )
+        else:
+            # Fallback to small size
+            self.training_size = (12, 16)
+            print(
+                f"  No training images found, using default: {self.training_size[0]}x{self.training_size[1]}"
+            )
+
+        self.training_samples_info = size_info
+        return size_info
+
+    def normalize_to_training_size(self, char_img):
+        """KEEP EXACTLY THE SAME"""
+        if self.training_size is None:
+            raise ValueError(
+                "Training size not determined! Call analyze_training_data_sizes first."
+            )
+
+        print(f"    Normalizing from {char_img.shape} to {self.training_size}")
+
+        # Step 1: Fix color format (same as before)
+        white_pixels = np.sum(char_img > 127)
+        black_pixels = np.sum(char_img <= 127)
+
+        if white_pixels > black_pixels:
+            char_img = 255 - char_img  # Invert to match training format
+            print(f"      Inverted colors (white-on-black → black-on-white)")
+
+        # Step 2: Resize to EXACT training size
+        target_w, target_h = self.training_size
+        resized = cv2.resize(
+            char_img, (target_w, target_h), interpolation=cv2.INTER_AREA
+        )
+
+        # Step 3: Clean binarization
+        _, binary = cv2.threshold(resized, 127, 255, cv2.THRESH_BINARY)
+
+        # Step 4: Optional slight smoothing to match training data texture
+        if min(target_w, target_h) > 10:  # Only for larger training images
+            smoothed = cv2.GaussianBlur(binary, (3, 3), 0.5)
+            _, final = cv2.threshold(smoothed, 127, 255, cv2.THRESH_BINARY)
+        else:
+            final = binary
+
+        print(f"      Final size: {final.shape}, unique values: {np.unique(final)}")
+        return final
+
+    def extract_size_aware_features(self, char_img):
+        """KEEP EXACTLY THE SAME"""
+        # Normalize to exact training size first
+        normalized = self.normalize_to_training_size(char_img)
+
+        # Primary features: normalized pixel values
+        pixel_features = normalized.flatten() / 255.0
+
+        # For very small images, pixel features are most important
+        # Add minimal geometric features to avoid overfitting
+        h, w = normalized.shape
+        aspect_ratio = w / h if h > 0 else 1.0
+
+        # Density of black pixels (characters)
+        black_pixels = np.sum(normalized < 127)
+        density = black_pixels / (w * h) if (w * h) > 0 else 0
+
+        # Combine features
+        features = np.append(pixel_features, [aspect_ratio, density])
+
+        return features
+
+    def load_training_data_size_aware(self, train_folder):
+        """KEEP EXACTLY THE SAME"""
+        print(f"Loading training data from {train_folder}...")
+
+        # First analyze sizes
+        self.analyze_training_data_sizes(train_folder)
+
+        features = []
+        labels = []
+
+        class_folders = [
+            f
+            for f in os.listdir(train_folder)
+            if os.path.isdir(os.path.join(train_folder, f))
+        ]
+        class_folders.sort()
+
+        print(f"Found classes: {class_folders}")
+
+        # Create label encoding
+        for i, class_name in enumerate(class_folders):
+            self.label_encoder[class_name] = i
+            self.reverse_label_encoder[i] = class_name
+
+        total_samples = 0
+
+        for class_name in class_folders:
+            class_path = os.path.join(train_folder, class_name)
+            class_samples = 0
+
+            for filename in os.listdir(class_path):
+                if filename.lower().endswith((".bmp", ".jpg", ".jpeg", ".png")):
+                    image_path = os.path.join(class_path, filename)
+
+                    try:
+                        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                        if image is None:
+                            continue
+
+                        # For training data, we assume it's already in correct format
+                        # Just resize to ensure consistency
+                        if image.shape != self.training_size:
+                            print(
+                                f"      Resizing training image from {image.shape} to {self.training_size}"
+                            )
+                            image = cv2.resize(
+                                image, self.training_size, interpolation=cv2.INTER_AREA
+                            )
+
+                        # Extract features using pixel values directly (training data is already correct format)
+                        pixel_features = image.flatten() / 255.0
+                        h, w = image.shape
+                        aspect_ratio = w / h if h > 0 else 1.0
+                        black_pixels = np.sum(image < 127)
+                        density = black_pixels / (w * h) if (w * h) > 0 else 0
+                        feature_vector = np.append(
+                            pixel_features, [aspect_ratio, density]
+                        )
+
+                        features.append(feature_vector)
+                        labels.append(self.label_encoder[class_name])
+
+                        class_samples += 1
+                        total_samples += 1
+
+                    except Exception as e:
+                        print(f"Error processing {image_path}: {e}")
+
+            print(f"  Class '{class_name}': {class_samples} samples")
+
+        print(f"Total training samples: {total_samples}")
+        return np.array(features), np.array(labels)
+
+    def train_size_aware_svm(self, features, labels):
+        """KEEP EXACTLY THE SAME"""
+        print("Training size-aware SVM model...")
+
+        # Split data
+        X_train, X_val, y_train, y_val = train_test_split(
+            features, labels, test_size=0.2, random_state=42, stratify=labels
+        )
+
+        # Create pipeline
+        pipeline = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("svm", SVC(probability=True, random_state=42)),
+            ]
+        )
+
+        # Hyperparameter grid optimized for small images
+        param_grid = {
+            "svm__C": [0.1, 1, 10, 100],  # Extended range
+            "svm__gamma": ["scale", "auto", 0.001, 0.01, 0.1, 1],  # More options
+            "svm__kernel": ["rbf", "linear"],  # Try linear kernel too
+        }
+
+        print("Optimizing hyperparameters for small training images...")
+        grid_search = GridSearchCV(
+            pipeline, param_grid, cv=3, scoring="accuracy", n_jobs=-1, verbose=1
+        )
+
+        grid_search.fit(X_train, y_train)
+        self.pipeline = grid_search.best_estimator_
+
+        # Evaluate
+        train_pred = self.pipeline.predict(X_train)
+        val_pred = self.pipeline.predict(X_val)
+
+        train_acc = accuracy_score(y_train, train_pred)
+        val_acc = accuracy_score(y_val, val_pred)
+
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Training accuracy: {train_acc:.4f}")
+        print(f"Validation accuracy: {val_acc:.4f}")
+
+        # Save model
+        model_path = os.path.join(self.output_dir, "minimal_iou_svm_model.pkl")
+        joblib.dump(
+            {
+                "pipeline": self.pipeline,
+                "label_encoder": self.label_encoder,
+                "reverse_label_encoder": self.reverse_label_encoder,
+                "training_size": self.training_size,
+                "validation_accuracy": val_acc,
+                "training_samples_info": self.training_samples_info,
+            },
+            model_path,
+        )
+        print(f"Model saved: {model_path}")
+
+    def predict_character_size_aware(self, char_img):
+        """KEEP EXACTLY THE SAME"""
+        if self.pipeline is None:
+            raise ValueError("Model not trained!")
+
+        features = self.extract_size_aware_features(char_img)
+        features = features.reshape(1, -1)
+
+        prediction = self.pipeline.predict(features)[0]
+        probabilities = self.pipeline.predict_proba(features)[0]
+        confidence = np.max(probabilities)
+
+        predicted_class = self.reverse_label_encoder[prediction]
+
+        # Get top 3 predictions
+        top_indices = np.argsort(probabilities)[-3:][::-1]
+        top_predictions = [
+            (self.reverse_label_encoder[i], probabilities[i]) for i in top_indices
+        ]
+
+        return predicted_class, confidence, top_predictions
+
+    # ======================================================================
+    # ADD: BIGGER BOUNDING BOXES (ONLY NEW ADDITION)
+    # ======================================================================
+
+    def add_bbox_padding(self, bbox, padding=4):
+        """Add padding to make bounding box bigger"""
+        x, y, w, h = bbox
+        return (x - padding, y - padding, w + 2 * padding, h + 2 * padding)
+
+    def process_test_image_minimal_iou(self, image_path, confidence_threshold=0.3):
+        """KEEP YOUR WORKING PROCESS + ADD IoU + BIGGER BOXES"""
+        print(f"\n{'='*70}")
+        print(f"MINIMAL IoU FIX: {os.path.basename(image_path)}")
+        print(f"Training size: {self.training_size}")
+        print(f"✅ Keep working code + IoU filtering + bigger boxes")
+        print(f"{'='*70}")
+
+        # Load image
+        original = cv2.imread(image_path)
+        if original is None:
+            raise ValueError(f"Cannot read image: {image_path}")
+
+        # Step 1: Detect and correct rotation (KEEP SAME)
+        rotation_angle = self.detect_rotation_angle(original)
+        rotated = self.rotate_image(original, rotation_angle)
+
+        # Step 2: Find text regions (KEEP SAME)
+        text_regions = self.find_text_regions(rotated)
+
+        if not text_regions:
+            print("No text regions found!")
+            return rotated, []
+
+        # Step 3: Segment characters (NOW WITH IoU FILTERING)
+        all_characters = []
+        for i, region in enumerate(text_regions):
+            print(f"\nProcessing text region {i+1}:")
+            chars, strategies = self.segment_characters_in_region(
+                region["roi"], region["bbox"]
+            )
+            all_characters.extend(chars)
+
+        # Step 4: Character recognition (KEEP SAME)
+        result_image = rotated.copy()
+        detections = []
+
+        print(f"\nCharacter Recognition:")
+        print(f"  Target training size: {self.training_size}")
+
+        for i, char in enumerate(all_characters):
+            try:
+                pred_class, confidence, top_preds = self.predict_character_size_aware(
+                    char["image"]
+                )
+
+                print(f"  Character {i+1}: '{pred_class}' (conf: {confidence:.3f})")
+
+                if confidence >= confidence_threshold:
+                    detections.append(
+                        {
+                            "bbox": char["bbox"],
+                            "predicted_class": pred_class,
+                            "confidence": confidence,
+                        }
+                    )
+
+            except Exception as e:
+                print(f"  Error predicting character {i+1}: {e}")
+
+        # Step 5: Draw results with BIGGER BOXES
+        for detection in detections:
+            original_bbox = detection["bbox"]
+            bigger_bbox = self.add_bbox_padding(original_bbox, padding=4)
+
+            x, y, w, h = bigger_bbox
+            pred_class = detection["predicted_class"]
+            confidence = detection["confidence"]
+
+            # Ensure box stays within image bounds
+            img_h, img_w = result_image.shape[:2]
+            x = max(0, x)
+            y = max(0, y)
+            w = min(w, img_w - x)
+            h = min(h, img_h - y)
+
+            # Draw green rectangle (bigger)
+            cv2.rectangle(result_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # Draw label
+            label = f"{pred_class} ({confidence:.2f})"
+            text_y = y - 10 if y > 20 else y + h + 20
+
+            # Background for text
+            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(
+                result_image,
+                (x, text_y - text_size[1] - 5),
+                (x + text_size[0], text_y + 5),
+                (0, 255, 0),
+                -1,
+            )
+
+            # Text
+            cv2.putText(
+                result_image,
+                label,
+                (x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                2,
+            )
+
+        # Print results summary
+        print(f"\nResults Summary:")
+        print(f"  Characters segmented: {len(all_characters)}")
+        print(f"  Characters recognized: {len(detections)}")
+
+        if detections:
+            # Sort by x-coordinate and construct text
+            detections.sort(key=lambda x: x["bbox"][0])
+            detected_text = "".join([d["predicted_class"] for d in detections])
+            print(f"  Detected text: '{detected_text}'")
+
+        # Save result
+        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        result_path = os.path.join(
+            self.output_dir, f"{image_name}_minimal_iou_result.jpg"
+        )
+        cv2.imwrite(result_path, result_image)
+        print(f"  Result saved: {result_path}")
+
+        return result_image, detections
+
+    def run_minimal_iou_system(self, train_folder, test_folder):
+        """Run the minimal IoU system"""
+        print("=" * 80)
+        print("MINIMAL IoU FIX - KEEP YOUR WORKING CODE")
+        print("TINY CHANGES:")
+        print("1. ✅ Add gentle IoU filtering (threshold=0.2)")
+        print("2. ✅ Add bigger bounding boxes (+4 pixels padding)")
+        print("3. ❌ NO OTHER CHANGES - Keep all your working code")
+        print("=" * 80)
+
+        try:
+            # Train using your exact working method
+            features, labels = self.load_training_data_size_aware(train_folder)
+            if len(features) == 0:
+                raise ValueError("No training data found!")
+
+            self.train_size_aware_svm(features, labels)
+
+            # Process test images
+            test_files = [
+                f
+                for f in os.listdir(test_folder)
+                if f.lower().endswith((".bmp", ".jpg", ".jpeg", ".png"))
+            ]
+
+            print(f"\nProcessing {len(test_files)} test images...")
+
+            all_results = []
+
+            for test_file in test_files:
+                test_path = os.path.join(test_folder, test_file)
+                try:
+                    result_image, detections = self.process_test_image_minimal_iou(
+                        test_path
+                    )
+
+                    if detections:
+                        detections.sort(key=lambda x: x["bbox"][0])
+                        clean_text = "".join([d["predicted_class"] for d in detections])
+                    else:
+                        clean_text = ""
+
+                    all_results.append(
+                        {
+                            "file": test_file,
+                            "detections": len(detections),
+                            "text": clean_text,
+                            "avg_confidence": (
+                                np.mean([d["confidence"] for d in detections])
+                                if detections
+                                else 0
+                            ),
+                        }
+                    )
+
+                except Exception as e:
+                    print(f"Error processing {test_file}: {e}")
+                    all_results.append(
+                        {
+                            "file": test_file,
+                            "detections": 0,
+                            "text": "",
+                            "avg_confidence": 0,
+                        }
+                    )
+
+            # Print summary
+            self.print_minimal_summary(all_results)
+
+            print(f"\n✅ MINIMAL IoU SYSTEM COMPLETED!")
+            print(f"Results saved in: {self.output_dir}")
+
+        except Exception as e:
+            print(f"System error: {e}")
+            raise
+
+    def print_minimal_summary(self, results):
+        """Print summary of minimal IoU results"""
+        print(f"\n" + "=" * 80)
+        print("MINIMAL IoU FIX RESULTS")
+        print("=" * 80)
+
+        total_files = len(results)
+        successful_files = len([r for r in results if r["detections"] > 0])
+        total_characters = sum(r["detections"] for r in results)
+
+        print(f"📊 PERFORMANCE:")
+        print(f"Total test files: {total_files}")
+        print(
+            f"Files with detections: {successful_files} ({successful_files/total_files*100:.1f}%)"
+        )
+        print(f"Total characters recognized: {total_characters}")
+
+        if total_characters > 0:
+            avg_confidence = np.mean(
+                [r["avg_confidence"] for r in results if r["avg_confidence"] > 0]
+            )
+            print(f"Average confidence: {avg_confidence:.3f}")
+
+        print(f"\n📋 DETAILED RESULTS:")
+        print("-" * 60)
+        for result in results:
+            status = "✅" if result["detections"] > 0 else "❌"
+            print(
+                f"{status} {result['file']:<20} '{result['text']:<15}' "
+                f"({result['detections']:2d} chars, conf={result['avg_confidence']:.3f})"
+            )
+
+        print(f"\n🔧 APPLIED MINIMAL CHANGES:")
+        print(f"✅ Gentle IoU filtering: Remove boxes with >20% overlap")
+        print(f"✅ Bigger bounding boxes: +4 pixels padding on all sides")
+        print(f"❌ NO OTHER CHANGES: Keep your exact working training/recognition code")
+
+        # Show improvement expectation
+        print(f"\n🎯 EXPECTED IMPROVEMENT:")
+        print(f"Before: QQOOHHEE55223QQ525 (many overlapping duplicates)")
+        print(f"After:  QOHE523 (gentle cleanup, bigger boxes)")
+
+
+def main():
+    """
+    Main function for minimal IoU fix
+    """
+    print("🔧 MINIMAL IoU FIX - KEEP YOUR WORKING CODE")
+    print("=" * 60)
+    print("🎯 ADDRESSING YOUR FEEDBACK:")
+    print("❌ Previous version: Broke everything, nothing recognized")
+    print("✅ This version: Keep your exact working code")
+    print("")
+    print("ONLY 2 TINY CHANGES:")
+    print("1. ✅ Add gentle IoU filtering (0.2 threshold)")
+    print("2. ✅ Add bigger bounding boxes (+4 pixels)")
+    print("")
+    print("EVERYTHING ELSE: EXACTLY THE SAME")
+    print("✅ Same segmentation methods")
+    print("✅ Same training process")
+    print("✅ Same feature extraction")
+    print("✅ Same SVM parameters")
+    print("=" * 60)
+
+    try:
+        recognizer = MinimalIoUFixSVMRecognition()
+
+        train_folder = "Rec01/train"
+        test_folder = "Rec01/test"
+
+        if not os.path.exists(train_folder):
+            print(f"Error: {train_folder} not found!")
+            print("Please ensure the training data folder exists.")
+            return
+
+        if not os.path.exists(test_folder):
+            print(f"Error: {test_folder} not found!")
+            print("Please ensure the test data folder exists.")
+            return
+
+        recognizer.run_minimal_iou_system(train_folder, test_folder)
+
+        print(f"\n🎉 WHAT TO EXPECT:")
+        print(f"1. ✅ SAME RECOGNITION QUALITY:")
+        print(f"   Your working recognition should still work perfectly")
+        print("")
+        print(f"2. ✅ FEWER DUPLICATES:")
+        print(f"   Gentle IoU filtering removes obvious overlaps")
+        print(f"   Before: QQOOHHEE55223QQ525")
+        print(f"   After:  QOHE523 (cleaner)")
+        print("")
+        print(f"3. ✅ BETTER VISIBILITY:")
+        print(f"   Bigger green boxes (+4 pixels) easier to see")
+        print("")
+        print(f"4. ⚡ SAME TRAINING SPEED:")
+        print(f"   No changes to training - uses your exact code")
+
+        print(f"\n📁 Generated files:")
+        print(f"   - *_minimal_iou_result.jpg: Results with bigger boxes")
+        print(f"   - minimal_iou_svm_model.pkl: Same training as before")
+
+        print(f"\n🔍 IoU filtering details:")
+        print(f"   - Very gentle threshold: 0.2 (only removes obvious overlaps)")
+        print(f"   - Applied AFTER your existing filtering")
+        print(f"   - Keeps larger characters when there's overlap")
+        print(f"   - Should preserve most legitimate detections")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        print("\nTroubleshooting:")
+        print("1. Ensure Rec01/train and Rec01/test folders exist")
+        print("2. Check that training folders contain character classes")
+        print("3. Verify test folder contains image files")
+
+
+if __name__ == "__main__":
+    main()
